@@ -26,9 +26,9 @@ export const ROUTES = {
 export const NAV_ITEMS = [
   { path: ROUTES.ponds, label: '蒸发池台账', hint: '池系 · 阶段 · 当期密度' },
   { path: ROUTES.gates, label: '闸门串级', hint: '走向拓扑 · 开度就地编辑' },
-  { path: ROUTES.observations, label: '卤水日观测', hint: '密度 · 温度 · 蒸发量' },
+  { path: ROUTES.observations, label: '气象日报', hint: '蒸发皿读数 · 复测作废' },
   { path: ROUTES.assays, label: '离子组分', hint: '达标判定 · 组分曲线' },
-  { path: ROUTES.schedules, label: '走水编排', hint: '拖拽排序 · 出卤推进' },
+  { path: ROUTES.schedules, label: '走水编排', hint: '对账挂起 · 拖拽出卤' },
   { path: ROUTES.export, label: '晒程汇总', hint: '进度 · JSON 导入导出' },
 ] as const;
 

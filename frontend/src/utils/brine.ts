@@ -7,6 +7,7 @@
  */
 import type { Assay, AssayVerdict } from '../types/assay';
 import type { Gate } from '../types/gate';
+import type { Observation } from '../types/observation';
 
 /** 保留 1 位小数 */
 export function round1(value: number): number {
@@ -52,6 +53,40 @@ export function estimateEvapMm(
   // 水位低于 10 cm 时按比例折减，避免浅池出现不合理的大蒸发量
   const levelFactor = levelCm >= 10 ? 1 : Math.max(0.3, levelCm / 10);
   return round1(EVAP_BASE_MM * tempFactor * windFactor * brineFactor * levelFactor);
+}
+
+/** 蒸发皿折算系数（淡水皿读数折算到卤水水面的粗系数） */
+export const PAN_COEFFICIENT = 0.72;
+
+/**
+ * 旧日报没有蒸发皿读数时，按当时气温、风力反推一笔（mm/d）。
+ * 只取气温与风力，作为升级迁移的兜底读数，与卤水经验公式区分。
+ */
+export function inferPanMm(tempC: number, windLevel: number): number {
+  const tempFactor = 1 + Math.max(0, tempC - 10) * 0.024;
+  const windFactor = 1 + Math.max(0, windLevel) * 0.07;
+  return round1(7.6 * tempFactor * windFactor);
+}
+
+/**
+ * 调度侧水量台账采用的蒸发量（mm/d）：
+ * 有气象站蒸发皿读数时以读数折算为准，否则回落到卤水经验公式估算。
+ */
+export function effectiveEvapMm(
+  row: Pick<Observation, 'densityGcm3' | 'tempC' | 'levelCm' | 'windLevel' | 'panMm'>,
+): number {
+  if (typeof row.panMm === 'number' && Number.isFinite(row.panMm) && row.panMm > 0) {
+    return round1(row.panMm * PAN_COEFFICIENT);
+  }
+  return estimateEvapMm(row.densityGcm3, row.tempC, row.levelCm, row.windLevel);
+}
+
+/**
+ * 蒸发皿读数折算成单池单日蒸发水量（m³）：
+ * 读数(mm) × 折算系数 × 池面积(㎡) / 1000。
+ */
+export function panToVolumeM3(panMm: number, areaM2: number): number {
+  return Math.round(panMm * PAN_COEFFICIENT * areaM2) / 1000;
 }
 
 /** 密度增速（g/cm³/天） */

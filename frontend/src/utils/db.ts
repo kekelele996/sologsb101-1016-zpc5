@@ -3,6 +3,8 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：气象日报增加蒸发皿读数（panMm）/ 读数来源 / 日报状态，走水编排增加挂起与对账字段；
+ *       旧日报没有蒸发皿读数的，升级时按当时气温风力反推一笔
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,18 +13,19 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule, ScheduleState } from '../types/schedule';
-import { estimateEvapMm } from './brine';
+import { effectiveEvapMm, estimateEvapMm, inferPanMm } from './brine';
 import { nowIso } from './id';
 import { seedDatabase } from './seed';
+import { reconcilePondDate } from './reconcile';
 
 /** 数据库名 */
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -44,7 +47,7 @@ class BrinePondDatabase extends Dexie {
     });
 
     // ---------- v2：新增 evapMm 字段，并为旧记录补齐默认值 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
         gates: 'id, fromPondId, toPondId, state, openingPct',
@@ -88,6 +91,50 @@ class BrinePondDatabase extends Dexie {
             const date = typeof row.planDate === 'string' ? row.planDate : '2026-01-01';
             row.orderIndex = Number(date.replace(/-/g, '')) || 1;
           }
+        });
+      });
+
+    // ---------- v3：气象日报蒸发皿读数 + 走水挂起 / 对账字段 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm, panMm, status',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex, reconcileStatus',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 5：旧日报没有蒸发皿读数，升级时按当时气温 / 风力反推一笔
+        await tx.table('observations').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.panSource !== 'string') {
+            row.panSource = typeof row.panMm === 'number' && Number.isFinite(row.panMm) ? '实测' : '反推';
+          }
+          if (row.panSource === '反推' && !(typeof row.panMm === 'number' && Number.isFinite(row.panMm))) {
+            const tempC = typeof row.tempC === 'number' ? row.tempC : 25;
+            const windLevel = typeof row.windLevel === 'number' ? row.windLevel : 2;
+            row.panMm = inferPanMm(tempC, windLevel);
+          }
+          if (typeof row.status !== 'string') row.status = '有效';
+          if (typeof row.voidReason !== 'string') row.voidReason = '';
+          // 有了读数后，调度侧蒸发量以读数折算为准
+          if (typeof row.panMm === 'number' && Number.isFinite(row.panMm)) {
+            row.evapMm = effectiveEvapMm({
+              densityGcm3: typeof row.densityGcm3 === 'number' ? row.densityGcm3 : 1.02,
+              tempC: typeof row.tempC === 'number' ? row.tempC : 25,
+              levelCm: typeof row.levelCm === 'number' ? row.levelCm : 40,
+              windLevel: typeof row.windLevel === 'number' ? row.windLevel : 2,
+              panMm: row.panMm as number,
+            });
+          }
+        });
+        // 迁移 6：走水编排补齐挂起与对账字段
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.stateBeforeHold !== 'string') row.stateBeforeHold = null;
+          if (typeof row.holdReason !== 'string') row.holdReason = '';
+          if (typeof row.reconcileStatus !== 'string') row.reconcileStatus = '';
+          if (typeof row.basisReportId !== 'string') row.basisReportId = '';
+          if (typeof row.recomputeCount !== 'number') row.recomputeCount = 0;
+          if (typeof row.recomputedAt !== 'string') row.recomputedAt = '';
         });
       });
   }
@@ -172,29 +219,91 @@ export async function listObservationsByPond(pondId: string): Promise<Observatio
 }
 
 /**
- * 写入卤水日观测：同池同日仅保留一条（存在即覆盖原记录）。
- * evapMm 若未显式给出，则按经验公式自动估算。
+ * 写入气象日报（卤水日观测）：同池同日仅保留一条（存在即覆盖原记录）。
+ * 蒸发量优先采用蒸发皿读数折算，读数缺失时按经验公式自动估算。
+ * 写入后按「池号 + 日期」重对该日走水编排（挂起 / 恢复 / 重算）。
  */
 export async function upsertObservation(row: Observation): Promise<Observation> {
+  const existing = await db.observations.where('[pondId+date]').equals([row.pondId, row.date]).first();
+  const panMm =
+    typeof row.panMm === 'number' && Number.isFinite(row.panMm) && row.panMm > 0 ? row.panMm : null;
+  const status: Observation['status'] = row.status === '作废' ? '作废' : '有效';
+  const panSource: Observation['panSource'] = panMm === null ? '估算' : row.panSource ?? '实测';
   const evapMm =
     Number.isFinite(row.evapMm) && row.evapMm > 0
       ? row.evapMm
-      : estimateEvapMm(row.densityGcm3, row.tempC, row.levelCm, row.windLevel);
-  const existing = await db.observations.where('[pondId+date]').equals([row.pondId, row.date]).first();
+      : effectiveEvapMm({
+          densityGcm3: row.densityGcm3,
+          tempC: row.tempC,
+          levelCm: row.levelCm,
+          windLevel: row.windLevel,
+          panMm,
+        });
   const next: Observation = {
     ...row,
     id: existing === undefined ? row.id : existing.id,
+    panMm,
+    panSource,
+    status,
+    voidReason: typeof row.voidReason === 'string' ? row.voidReason : '',
     evapMm,
     createdAt: existing === undefined ? row.createdAt : existing.createdAt,
     updatedAt: nowIso(),
     revision: ROW_REVISION,
   };
   await db.observations.put(next);
+  // 事务提交后再触发对账（对账内部另开事务，避免嵌套事务）
+  await reconcilePondDate(next.pondId, next.date);
   return next;
 }
 
+/**
+ * 蒸发皿复测：该条日报作废。由它算出的水量与「没走」的编排随后由调度端重算 / 挂起，
+ * 已走完（走水中 / 已出卤）的水照旧留着。
+ */
+export async function voidObservation(id: string, reason: string): Promise<void> {
+  const row = await db.observations.get(id);
+  if (!row) return;
+  await db.observations.update(id, {
+    status: '作废',
+    voidReason: reason.trim() !== '' ? reason.trim() : '蒸发皿复测',
+    updatedAt: nowIso(),
+  });
+  await reconcilePondDate(row.pondId, row.date);
+}
+
+/**
+ * 复测读数写回：日报恢复有效，读数来源记为「复测」，挂起的走水自动恢复并重算水量。
+ */
+export async function remeasureObservation(id: string, panMm: number): Promise<void> {
+  const row = await db.observations.get(id);
+  if (!row) return;
+  const value = Number.isFinite(panMm) && panMm > 0 ? panMm : 0;
+  if (value <= 0) return;
+  await db.observations.update(id, {
+    panMm: value,
+    panSource: '复测',
+    status: '有效',
+    voidReason: '',
+    evapMm: effectiveEvapMm({
+      densityGcm3: row.densityGcm3,
+      tempC: row.tempC,
+      levelCm: row.levelCm,
+      windLevel: row.windLevel,
+      panMm: value,
+    }),
+    updatedAt: nowIso(),
+  });
+  await reconcilePondDate(row.pondId, row.date);
+}
+
+/** 删除日报后，对该池该日重新对账（可能把对应走水挂起） */
 export async function removeObservation(id: string): Promise<void> {
+  const row = await db.observations.get(id);
+  if (!row) return;
+  const { pondId, date } = row;
   await db.observations.delete(id);
+  await reconcilePondDate(pondId, date);
 }
 
 /* ------------------------------ 离子组分分析 ------------------------------ */
@@ -225,7 +334,17 @@ export async function listSchedules(): Promise<Schedule[]> {
 }
 
 export async function putSchedule(row: Schedule): Promise<void> {
-  await db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.schedules.put({
+    ...row,
+    stateBeforeHold: row.stateBeforeHold ?? null,
+    holdReason: row.holdReason ?? '',
+    reconcileStatus: row.reconcileStatus ?? '',
+    basisReportId: row.basisReportId ?? '',
+    recomputeCount: typeof row.recomputeCount === 'number' ? row.recomputeCount : 0,
+    recomputedAt: row.recomputedAt ?? '',
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  });
 }
 
 export async function removeSchedule(id: string): Promise<void> {
@@ -259,7 +378,13 @@ export async function applyDischarge(scheduleId: string, actualDensity: number):
     const density = actualDensity > 0 ? actualDensity : latest.densityGcm3;
     await db.observations.update(latest.id, {
       densityGcm3: density,
-      evapMm: estimateEvapMm(density, latest.tempC, latest.levelCm, latest.windLevel),
+      evapMm: effectiveEvapMm({
+        densityGcm3: density,
+        tempC: latest.tempC,
+        levelCm: latest.levelCm,
+        windLevel: latest.windLevel,
+        panMm: latest.panMm,
+      }),
       updatedAt: nowIso(),
     });
   });

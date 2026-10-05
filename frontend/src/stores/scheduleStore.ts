@@ -14,7 +14,9 @@ import {
   putSchedule,
   removeSchedule,
   reorderSchedules,
+  ROW_REVISION,
 } from '../utils/db';
+import { reconcileAll, reconcileSchedule } from '../utils/reconcile';
 import { nowIso, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
 
@@ -84,12 +86,25 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      stateBeforeHold: null,
+      holdReason: '',
+      reconcileStatus: '',
+      basisReportId: '',
+      recomputeCount: 0,
+      recomputedAt: '',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSchedule(row);
-    setState('lastMessage', `已新建走水计划：${row.planDate}`);
+    // 排走水即按池号 + 日期对账：日报缺读数时把这口池挂起
+    const counts = await reconcileSchedule(row.id);
+    setState(
+      'lastMessage',
+      counts.held > 0
+        ? `已新建走水计划：${row.planDate}，当日气象日报还缺蒸发皿读数，该池走水已挂起`
+        : `已新建走水计划：${row.planDate}，已按池号+日期与气象日报对账`,
+    );
     return row;
   }
 
@@ -117,6 +132,10 @@ function createScheduleStore() {
   async function advance(scheduleId: string): Promise<ScheduleState | null> {
     const existing = state.rows.find((row) => row.id === scheduleId);
     if (existing === undefined) return null;
+    if (existing.state === '挂起') {
+      setState('lastMessage', `走水挂起中：${existing.holdReason || '等气象日报读数'}，读数补回后自动恢复`);
+      return null;
+    }
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
@@ -132,6 +151,28 @@ function createScheduleStore() {
         : `状态已推进为「${next}」`,
     );
     return next;
+  }
+
+  /** 全量对账：缺日报 / 缺读数的挂起，新补读数的恢复；已走完的水不动 */
+  async function reconcileAllSchedules(): Promise<void> {
+    const counts = await reconcileAll();
+    setState(
+      'lastMessage',
+      `对账完成：挂起 ${counts.held} 条、恢复 ${counts.resumed} 条、重算水量 ${counts.recomputed} 条、照旧 ${counts.locked} 条`,
+    );
+  }
+
+  /** 对单条编排重新对账 */
+  async function reconcileOne(scheduleId: string): Promise<void> {
+    const counts = await reconcileSchedule(scheduleId);
+    setState(
+      'lastMessage',
+      counts.held > 0
+        ? '该计划仍挂起：当日气象日报缺有效蒸发皿读数'
+        : counts.resumed > 0
+          ? '读数已到位：挂起恢复，水量已按读数重算'
+          : '对账完成，水量无变化',
+    );
   }
 
   /** 拖拽排序：把 fromId 移动到 toId 之前 */
@@ -170,6 +211,8 @@ function createScheduleStore() {
     updateSchedule,
     deleteSchedule,
     advance,
+    reconcileAllSchedules,
+    reconcileOne,
     moveBefore,
     moveToIndex,
   };

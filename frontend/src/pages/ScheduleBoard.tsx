@@ -12,7 +12,7 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
-import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
+import { SCHEDULE_STATE_OPTIONS, RECONCILE_STATUS_LABEL, isScheduleLocked, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
 import { today } from '../utils/id';
 
@@ -27,8 +27,16 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 const STATE_STYLE: Record<ScheduleState, string> = {
   待排: 'border-slate-300 bg-slate-100 text-slate-600',
   已排: 'border-sky-300 bg-sky-50 text-sky-700',
+  挂起: 'border-rose-300 bg-rose-50 text-rose-700',
   走水中: 'border-amber-300 bg-amber-50 text-amber-700',
   已出卤: 'border-emerald-300 bg-emerald-50 text-emerald-700',
+};
+
+const RECONCILE_STYLE: Record<string, string> = {
+  已对账: 'text-emerald-700',
+  待读数: 'text-rose-600',
+  无日报: 'text-rose-600',
+  日报作废: 'text-rose-600',
 };
 
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
@@ -89,9 +97,11 @@ export default function ScheduleBoard() {
     return {
       total: list.length,
       pending: list.filter((row) => row.state === '待排').length,
+      held: list.filter((row) => row.state === '挂起').length,
       running: list.filter((row) => row.state === '走水中').length,
       done: list.filter((row) => row.state === '已出卤').length,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
+      recomputed: list.filter((row) => row.recomputeCount > 0).length,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
   });
@@ -149,6 +159,7 @@ export default function ScheduleBoard() {
   const nextStateLabel = (state: ScheduleState): string => {
     if (state === '待排') return '标记已排';
     if (state === '已排') return '开始走水';
+    if (state === '挂起') return '挂起中';
     if (state === '走水中') return '完成出卤';
     return '已出卤';
   };
@@ -158,9 +169,11 @@ export default function ScheduleBoard() {
       <div class="flex flex-wrap gap-3">
         <StatBadge label="走水计划" value={stats().total} suffix="条" tone="primary" />
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
+        <StatBadge label="挂起等读数" value={stats().held} suffix="条" tone="warning" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
+        <StatBadge label="水量已重算" value={stats().recomputed} suffix="条" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
 
@@ -173,9 +186,20 @@ export default function ScheduleBoard() {
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="text-[15px] font-semibold text-slate-800">走水与出卤编排</h2>
-          <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
-            + 新建走水计划
-          </button>
+          <div class="flex flex-wrap gap-2">
+            <button
+              type="button"
+              class={BTN_GHOST}
+              onClick={() => void scheduleStore.reconcileAllSchedules()}
+              disabled={pondStore.state.ponds.length === 0}
+              title="按池号+日期与气象日报全量对账"
+            >
+              对账（池号+日期）
+            </button>
+            <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={pondStore.state.ponds.length === 0}>
+              + 新建走水计划
+            </button>
+          </div>
         </header>
 
         <FilterBar
@@ -200,7 +224,7 @@ export default function ScheduleBoard() {
         <Show when={ordered().length === 0}>
           <EmptyPanel
             title="还没有走水编排"
-            description="为蒸发池编排走水日期、目标密度与计划量，拖拽列表可以调整走水先后顺序，逐条推进到「已出卤」会自动回写池阶段。"
+            description="按池号+日期与气象日报对账后编排走水：日报缺蒸发皿读数时先挂起该池，读数复测补回后恢复重算；已走完的水照旧保留。拖拽列表可调整走水先后顺序。"
             actionText="新建第一条走水计划"
             onAction={openCreate}
           />
@@ -254,9 +278,6 @@ export default function ScheduleBoard() {
                   </div>
                   <div class="text-xs text-slate-600">
                     <p>
-                      计划量 <span class="tabular-nums font-medium text-slate-800">{row.volumeM3}</span> m³
-                    </p>
-                    <p>
                       组分判定{' '}
                       <span class="font-medium text-slate-800">
                         {(() => {
@@ -268,17 +289,46 @@ export default function ScheduleBoard() {
                       </span>
                     </p>
                   </div>
+                  <div class="text-xs text-slate-600">
+                    <p>
+                      计划量 <span class="tabular-nums font-medium text-slate-800">{row.volumeM3}</span> m³
+                      <Show when={row.recomputeCount > 0}>
+                        <span class="ml-1 rounded border border-sky-300 bg-sky-50 px-1 py-0.5 text-[10px] text-sky-700">
+                          已重算 ×{row.recomputeCount}
+                        </span>
+                      </Show>
+                      <Show when={isScheduleLocked(row.state)}>
+                        <span class="ml-1 rounded border border-slate-200 bg-slate-50 px-1 py-0.5 text-[10px] text-slate-500">
+                          水量照旧
+                        </span>
+                      </Show>
+                    </p>
+                    <p>
+                      对账{' '}
+                      <span class={`font-medium ${row.reconcileStatus === '' ? 'text-slate-400' : RECONCILE_STYLE[row.reconcileStatus] ?? 'text-slate-600'}`}>
+                        {row.reconcileStatus === '' ? '未对账' : RECONCILE_STATUS_LABEL[row.reconcileStatus]}
+                      </span>
+                    </p>
+                    <Show when={row.state === '挂起'}>
+                      <p class="text-rose-600">挂起原因：{row.holdReason || '—'}（恢复后回到「{row.stateBeforeHold ?? '已排'}」）</p>
+                    </Show>
+                  </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
-                      onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
-                      }}
+                      disabled={row.state === '已出卤' || row.state === '挂起'}
+                      title={row.state === '挂起' ? '走水挂起中：等气象日报蒸发皿读数' : ''}
+                      onClick={() => void scheduleStore.advance(row.id)}
                     >
                       {nextStateLabel(row.state)}
+                    </button>
+                    <button
+                      class="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-600 transition hover:bg-slate-100"
+                      title="按池号+日期与气象日报重新对账"
+                      onClick={() => void scheduleStore.reconcileOne(row.id)}
+                    >
+                      对账
                     </button>
                     <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(row)}>
                       编辑
@@ -379,7 +429,8 @@ export default function ScheduleBoard() {
           </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
-          状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
+          排走水按「池号 + 日期」与气象日报对账：当日日报还没蒸发皿读数时该池走水先挂起，读数补回（复测写回）后自动恢复并重算水量；
+          已走完（走水中 / 已出卤）的水照旧保留。状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为实际密度。
         </p>
       </AppDialog>
 

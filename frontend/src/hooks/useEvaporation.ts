@@ -20,6 +20,12 @@ export interface EvaporationPoint {
   levelCm: number;
   windLevel: number;
   evapMm: number;
+  /** 气象站蒸发皿读数（读数未出为 null） */
+  panMm: number | null;
+  /** 读数来源 */
+  panSource: Observation['panSource'];
+  /** 日报是否已作废 */
+  voided: boolean;
 }
 
 /** 某口池在给定日期区间内的蒸发与浓缩汇总 */
@@ -95,6 +101,9 @@ export function buildEvaporationSummary(
     levelCm: row.levelCm,
     windLevel: row.windLevel,
     evapMm: row.evapMm,
+    panMm: row.panMm,
+    panSource: row.panSource,
+    voided: row.status === '作废',
   }));
 
   const first = list[0];
