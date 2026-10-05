@@ -12,6 +12,7 @@ import {
   db,
   initDatabase,
   putSchedule,
+  reconcileSchedulesForPondDate,
   removeSchedule,
   reorderSchedules,
 } from '../utils/db';
@@ -83,13 +84,17 @@ function createScheduleStore() {
       volumeM3: draft.volumeM3,
       operator: draft.operator.trim(),
       state: draft.state,
+      suspended: false,
+      suspendReason: '',
       orderIndex: draft.orderIndex,
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,
     };
     await putSchedule(row);
-    setState('lastMessage', `已新建走水计划：${row.planDate}`);
+    // 对账：按池号+日期检查气象日报是否有有效读数，无读数则挂起该走水计划
+    await reconcileSchedulesForPondDate(row.pondId, row.planDate);
+    setState('lastMessage', `已新建走水计划：${row.planDate}，已与气象日报对账`);
     return row;
   }
 
@@ -106,7 +111,12 @@ function createScheduleStore() {
       state: draft.state,
       orderIndex: draft.orderIndex,
     });
-    setState('lastMessage', '走水计划已更新');
+    // 池号或日期变更后重新对账：旧池日与新池日的挂起状态都可能变化
+    await reconcileSchedulesForPondDate(draft.pondId, draft.planDate);
+    if (existing.pondId !== draft.pondId || existing.planDate !== draft.planDate) {
+      await reconcileSchedulesForPondDate(existing.pondId, existing.planDate);
+    }
+    setState('lastMessage', '走水计划已更新，已与气象日报重新对账');
   }
 
   async function deleteSchedule(scheduleId: string): Promise<void> {
@@ -117,6 +127,11 @@ function createScheduleStore() {
   async function advance(scheduleId: string): Promise<ScheduleState | null> {
     const existing = state.rows.find((row) => row.id === scheduleId);
     if (existing === undefined) return null;
+    // 挂起的走水计划不允许推进：日报暂无有效蒸发皿读数，需先补录气象日报
+    if (existing.suspended) {
+      setState('lastMessage', `该走水计划已挂起（${existing.suspendReason || '日报暂无有效蒸发皿读数'}），请先补录气象日报`);
+      return null;
+    }
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];

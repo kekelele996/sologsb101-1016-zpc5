@@ -24,6 +24,7 @@ export default function App(props: RouteSectionProps) {
     observations: pondStore.state.counts.observations ?? 0,
     assays: pondStore.state.counts.assays ?? 0,
     schedules: pondStore.state.counts.schedules ?? 0,
+    weatherReports: pondStore.state.counts.weatherReports ?? 0,
   });
 
   const currentSeries = () => pondStore.state.currentSeries ?? '全部池系';
@@ -47,6 +48,7 @@ export default function App(props: RouteSectionProps) {
           <span class="rounded-full bg-white/15 px-2.5 py-1">观测 {counts().observations} 条</span>
           <span class="rounded-full bg-white/15 px-2.5 py-1">化验 {counts().assays} 条</span>
           <span class="rounded-full bg-white/15 px-2.5 py-1">走水 {counts().schedules} 条</span>
+          <span class="rounded-full bg-white/15 px-2.5 py-1">日报 {counts().weatherReports} 条</span>
         </div>
       </header>
 
@@ -71,8 +73,8 @@ export default function App(props: RouteSectionProps) {
 
           <div class="mt-4 hidden rounded-lg border border-slate-200 bg-white p-3 text-xs leading-relaxed text-slate-500 lg:block">
             <p class="mb-1 font-semibold text-slate-700">数据存储</p>
-            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v2。</p>
-            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录。</p>
+            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v3。</p>
+            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录；v3 新增气象日报表，旧日报按气温风力反推蒸发皿读数，走水编排按池号+日期对账挂起。</p>
           </div>
         </nav>
 
@@ -89,7 +91,7 @@ export default function App(props: RouteSectionProps) {
       <footer class="flex flex-wrap items-center justify-between gap-2 px-5 pb-6 pt-2 text-xs text-slate-400">
         <span>数据仅存于本浏览器（IndexedDB 库名 gbbrinepond / localStorage），不上传任何服务器。</span>
         <span>
-          观测 {observationStore.stats().count} 条 · 走水 {scheduleStore.state.rows.length} 条 · 结构版本 v
+          观测 {observationStore.stats().count} 条 · 走水 {scheduleStore.state.rows.length} 条 · 日报 {counts().weatherReports} 条 · 结构版本 v
           {pondStore.state.counts.schemaVersion ?? '-'}
         </span>
       </footer>

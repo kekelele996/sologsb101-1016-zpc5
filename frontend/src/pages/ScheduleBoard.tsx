@@ -12,6 +12,7 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
+import { useWeatherStore } from '../stores/weatherStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
 import { effectiveVerdict } from '../utils/brine';
 import { today } from '../utils/id';
@@ -46,6 +47,7 @@ function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
 export default function ScheduleBoard() {
   const pondStore = usePondStore();
   const scheduleStore = useScheduleStore();
+  const weatherStore = useWeatherStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
@@ -61,6 +63,22 @@ export default function ScheduleBoard() {
   const pondLabel = (pondId: string): string => {
     const pond = pondOf(pondId);
     return pond === null ? '（池已删除）' : `${pond.code} · ${pond.seriesName}`;
+  };
+
+  /** 按池号+日期取有效蒸发皿读数（无日报时返回 null） */
+  const panEvapOf = (pondId: string, date: string): number | null => {
+    const rows = weatherStore.state.rows
+      .filter((row) => row.pondId === pondId && row.date === date && row.status === '有效' && row.panEvapMm > 0)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return rows.length > 0 ? rows[0].panEvapMm : null;
+  };
+
+  /** 建议走水量（日蒸发补水量）= 蒸发皿读数 × 池面积 / 1000（m³） */
+  const suggestedVolume = (pondId: string, date: string): number => {
+    const pond = pondOf(pondId);
+    const pan = panEvapOf(pondId, date);
+    if (pond === null || pan === null || pond.areaM2 <= 0) return 800;
+    return Math.round((pan * pond.areaM2) / 1000 * 10) / 10;
   };
 
   const ordered = createMemo<Schedule[]>(() =>
@@ -91,6 +109,7 @@ export default function ScheduleBoard() {
       pending: list.filter((row) => row.state === '待排').length,
       running: list.filter((row) => row.state === '走水中').length,
       done: list.filter((row) => row.state === '已出卤').length,
+      suspended: list.filter((row) => row.suspended && row.state !== '已出卤').length,
       volume: Math.round(list.reduce((acc, row) => acc + row.volumeM3, 0) * 10) / 10,
       donePct: list.length === 0 ? 0 : Math.round((list.filter((row) => row.state === '已出卤').length / list.length) * 1000) / 10,
     };
@@ -99,7 +118,7 @@ export default function ScheduleBoard() {
   const openCreate = (): void => {
     const pondId = pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '';
     setEditingId(null);
-    setDraft(emptyDraft(pondId, ordered().length + 1));
+    setDraft({ ...emptyDraft(pondId, ordered().length + 1), volumeM3: suggestedVolume(pondId, today()) });
     setDialogOpen(true);
   };
 
@@ -160,6 +179,7 @@ export default function ScheduleBoard() {
         <StatBadge label="待排" value={stats().pending} suffix="条" tone="default" />
         <StatBadge label="走水中" value={stats().running} suffix="条" tone="warning" />
         <StatBadge label="已出卤" value={stats().done} suffix="条" tone="success" />
+        <StatBadge label="对账挂起" value={stats().suspended} suffix="条" tone="danger" hint="日报暂无当天有效蒸发皿读数，补录气象日报后自动解除" />
         <StatBadge label="计划总量" value={stats().volume} suffix="m³" tone="info" />
         <StatBadge label="出卤完成率" value={`${stats().donePct}%`} percent={stats().donePct} tone="success" />
       </div>
@@ -268,14 +288,25 @@ export default function ScheduleBoard() {
                       </span>
                     </p>
                   </div>
-                  <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                  <div class="flex items-center gap-2">
+                    <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
+                    <Show when={row.suspended}>
+                      <span
+                        class="rounded border border-rose-300 bg-rose-50 px-2 py-0.5 text-[11px] text-rose-700"
+                        title={row.suspendReason || '日报暂无有效蒸发皿读数'}
+                      >
+                        已挂起
+                      </span>
+                    </Show>
+                  </div>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
-                      disabled={row.state === '已出卤'}
+                      disabled={row.state === '已出卤' || row.suspended}
+                      title={row.suspended ? row.suspendReason || '日报暂无有效蒸发皿读数' : ''}
                       onClick={async () => {
                         const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                        if (next === null && !row.suspended) scheduleStore.setMessage('该计划已处于「已出卤」状态');
                       }}
                     >
                       {nextStateLabel(row.state)}
@@ -380,6 +411,9 @@ export default function ScheduleBoard() {
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
           状态推进到「已出卤」时，会把该池推进到下一蒸发阶段，并把最新一次观测的密度回写为当前实际密度。
+          <Show when={panEvapOf(draft.pondId, draft.planDate) !== null} fallback={<>该池该日暂无有效气象日报，保存后走水将被<mark class="rounded bg-rose-100 px-0.5 text-rose-700">挂起</mark>，补录日报后自动解除。</>}>
+            该池该日蒸发皿读数 <span class="tabular-nums font-semibold text-brine-700">{panEvapOf(draft.pondId, draft.planDate)} mm/d</span>，建议走水量 <span class="tabular-nums font-semibold text-brine-700">{suggestedVolume(draft.pondId, draft.planDate)} m³</span>（日蒸发补水量）。
+          </Show>
         </p>
       </AppDialog>
 

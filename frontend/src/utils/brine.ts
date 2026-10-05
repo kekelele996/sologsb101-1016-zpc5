@@ -35,8 +35,28 @@ export function correctDensity(densityGcm3: number, tempC: number): number {
 /** 蒸发量经验公式基准值（mm/d） */
 export const EVAP_BASE_MM = 5.5;
 
+/** 温度因子：气温越高蒸发越强（10 ℃ 以下不折减） */
+function tempFactor(tempC: number): number {
+  return 1 + Math.max(0, tempC - 10) * 0.022;
+}
+
+/** 风力因子：风力越大蒸发越强 */
+function windFactor(windLevel: number): number {
+  return 1 + Math.max(0, windLevel) * 0.06;
+}
+
+/**
+ * 蒸发皿读数估算（mm/d）—— 气象站自由水面蒸发量
+ * 只与气温、风力有关（蒸发皿测得的是自由水面蒸发，不受卤水密度 / 水位折减）。
+ * 旧日报没有蒸发皿读数时，升级迁移按当时气温风力反推一笔。
+ */
+export function estimatePanEvapMm(tempC: number, windLevel: number): number {
+  return round1(EVAP_BASE_MM * tempFactor(tempC) * windFactor(windLevel));
+}
+
 /**
  * 蒸发量经验估算（mm/d）
+ * 在蒸发皿读数基础上，按卤水密度（水活度）与水位折减：
  * 温度越高、风力越大蒸发越强；卤水密度越高、水活度越低蒸发越弱。
  */
 export function estimateEvapMm(
@@ -46,12 +66,10 @@ export function estimateEvapMm(
   windLevel: number,
 ): number {
   if (!Number.isFinite(densityGcm3) || densityGcm3 <= 0) return 0;
-  const tempFactor = 1 + Math.max(0, tempC - 10) * 0.022;
-  const windFactor = 1 + Math.max(0, windLevel) * 0.06;
   const brineFactor = Math.max(0.15, Math.min(1.2, 1 - (densityGcm3 - 1.02) * 0.9));
   // 水位低于 10 cm 时按比例折减，避免浅池出现不合理的大蒸发量
   const levelFactor = levelCm >= 10 ? 1 : Math.max(0.3, levelCm / 10);
-  return round1(EVAP_BASE_MM * tempFactor * windFactor * brineFactor * levelFactor);
+  return round1(EVAP_BASE_MM * tempFactor(tempC) * windFactor(windLevel) * brineFactor * levelFactor);
 }
 
 /** 密度增速（g/cm³/天） */

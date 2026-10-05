@@ -1,15 +1,17 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
- * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
+ * 气象日报按观测日期生成蒸发皿读数（含一条复测作废记录），走水编排按池号+日期与气象日报对账。
+ * 所有 id 固定，保证 /gates、/observations、/assays、/schedules、/weather 打开就有真实串级与数据。
  */
-import { db, ROW_REVISION } from './db';
+import { db, ROW_REVISION, reconcileAllSchedules } from './db';
 import type { Pond } from '../types/pond';
 import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
-import { autoVerdict, estimateEvapMm } from './brine';
+import type { WeatherReport } from '../types/weather';
+import { autoVerdict, estimateEvapMm, estimatePanEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
 
@@ -45,6 +47,26 @@ function observation(
     levelCm,
     windLevel,
     evapMm: estimateEvapMm(densityGcm3, tempC, levelCm, windLevel),
+  });
+}
+
+/** 生成气象日报，蒸发皿读数按当时气温风力反推 */
+function weatherReport(
+  id: string,
+  pondId: string,
+  date: string,
+  tempC: number,
+  windLevel: number,
+  status: WeatherReport['status'] = '有效',
+  note = '',
+): WeatherReport {
+  return wrap<WeatherReport>({
+    id,
+    pondId,
+    date,
+    panEvapMm: estimatePanEvapMm(tempC, windLevel),
+    status,
+    note,
   });
 }
 
@@ -129,19 +151,43 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // 计划日期与气象日报日期对齐：有日报的池日对账后解除挂起，无日报的池日（如 10-12）挂起。
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-09-10', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', suspended: false, suspendReason: '', orderIndex: 1 }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-09-12', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', suspended: false, suspendReason: '', orderIndex: 2 }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-09-14', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', suspended: false, suspendReason: '', orderIndex: 3 }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', suspended: false, suspendReason: '', orderIndex: 4 }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-04', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', suspended: false, suspendReason: '', orderIndex: 5 }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  // ---------------- 气象日报（蒸发皿读数，按观测日期气温风力反推） ----------------
+  // 北-01 09-10 保留一条复测作废记录：旧报作废、新报有效，已出卤编排不受影响；
+  // 该日恰有走水编排（schedule-a1），复测后可演示未出卤编排的水量重算。
+  const weatherReports: WeatherReport[] = observations.map((obs) =>
+    weatherReport(
+      `weather-${obs.id}`,
+      obs.pondId,
+      obs.date,
+      obs.tempC,
+      obs.windLevel,
+      '有效',
+      obs.date === '2026-09-10' && obs.pondId === SEED_IDS.pondA ? '复测' : '',
+    ),
+  );
+  // 追加北-01 09-10 的复测作废旧报（读数明显低于复测值，标记作废）
+  weatherReports.push(
+    weatherReport('weather-obs-a3-void', SEED_IDS.pondA, '2026-09-10', 26, 1, '作废', '复测作废'),
+  );
+
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.weatherReports], async () => {
     await db.ponds.bulkPut(ponds);
     await db.gates.bulkPut(gates);
     await db.observations.bulkPut(observations);
     await db.assays.bulkPut(assays);
     await db.schedules.bulkPut(schedules);
+    await db.weatherReports.bulkPut(weatherReports);
   });
+
+  // 播种后全量对账：按池号+日期与气象日报核对，回写未出卤编排的挂起标记
+  await reconcileAllSchedules();
 }

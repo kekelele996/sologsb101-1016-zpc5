@@ -7,6 +7,7 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
+import { useWeatherStore } from '../stores/weatherStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
 import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
@@ -17,6 +18,7 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 
 export default function ExportView() {
   const store = usePondStore();
+  const weatherStore = useWeatherStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
 
@@ -29,6 +31,7 @@ export default function ExportView() {
     const observations = store.state.observations;
     const assays = store.state.assays;
     const schedules = store.state.schedules;
+    const weatherReports = weatherStore.state.rows;
     const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
     const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
@@ -38,6 +41,9 @@ export default function ExportView() {
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      weatherReports: weatherReports.length,
+      weatherValid: weatherReports.filter((row) => row.status === '有效').length,
+      weatherVoided: weatherReports.filter((row) => row.status === '作废').length,
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
@@ -108,12 +114,13 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="气象日报" value={summary().weatherReports} suffix="条" tone="info" hint={`有效 ${summary().weatherValid} · 作废 ${summary().weatherVoided}`} />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录，v3 新增气象日报表并按气温风力反推蒸发皿读数"
         />
       </div>
 

@@ -25,6 +25,10 @@ export interface Schedule {
   operator: string
   /** 走水状态 */
   state: ScheduleState
+  /** 是否被对账挂起：日报暂无当天有效蒸发皿读数时挂起，补录后自动解除 */
+  suspended: boolean
+  /** 挂起原因（对账时写入） */
+  suspendReason: string
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
   createdAt: string
